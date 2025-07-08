@@ -1,0 +1,75 @@
+# FastAPI and Core Dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Pydantic for Data Validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+email-validator==2.1.0
+
+# Firebase Integration
+firebase-admin==6.4.0
+google-cloud-firestore==2.13.1
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+cryptography==41.0.7
+
+# Environment Configuration
+python-dotenv==1.0.0
+
+# Email Support
+aiosmtplib==3.0.1
+
+# File Upload & Processing
+aiofiles==23.2.1
+python-magic-bin==0.4.14
+Pillow==10.1.0
+
+# Redis for Caching & Rate Limiting
+redis==5.0.1
+aioredis==2.0.1
+
+# Background Tasks
+celery==5.3.4
+
+# HTTP Client
+httpx==0.25.2
+
+# Rate Limiting
+slowapi==0.1.9
+
+# Template Engine
+Jinja2==3.1.2
+
+# Testing Dependencies
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-mock==3.12.0
+
+# Production Server
+gunicorn==21.2.0
+
+# Development Dependencies
+black==23.11.0
+isort==5.12.0
+flake8==6.1.0
+mypy==1.7.1
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.4.8
+
+# Monitoring & Logging
+structlog==23.2.0
+sentry-sdk[fastapi]==1.38.0
+
+# Database (if needed later)
+sqlalchemy==2.0.23
+alembic==1.13.0
+
+# Additional Utilities
+python-slugify==8.0.1
+pytz==2023.3

@@ -43,6 +43,30 @@ class UserResponse(UserBase):
     updated_at: datetime
     is_active: bool
 
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    display_name: str = Field(..., min_length=1, max_length=100)
+    company_name: Optional[str] = Field(None, max_length=200)
+    job_title: Optional[str] = Field(None, max_length=100)
+    industry: Optional[str] = Field(None, max_length=100)
+    location: Optional[str] = Field(None, max_length=100)
+    phone_number: Optional[str] = Field(None, pattern=r'^\+?1?\d{9,15}$')
+
+class AuthResponse(BaseModel):
+    user: UserResponse
+    token: str
+    refresh_token: str
+
+class LogoutResponse(BaseModel):
+    success: bool
+    message: str
+    timestamp: datetime
+
 # Group models
 class GroupBase(BaseModel):
     name: str = Field(..., min_length=3, max_length=100)

@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from procur.core.dependencies import get_current_user, get_optional_user
+from procur.core.dependencies import (
+    get_current_user, get_optional_user, require_group_admin
+)
 from procur.models.schemas import (
     InvitationCreate, InvitationResponse, InvitationValidateResponse,
     UserResponse, ReactAPIResponse
@@ -22,16 +24,11 @@ router = APIRouter()
 async def create_invitation(
     invitation_data: InvitationCreate,
     background_tasks: BackgroundTasks,
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(require_group_admin)
 ):
     """Create group invitation link with React-friendly response"""
     try:
         db = get_firestore_client()
-        
-        # Verify user is admin of the group
-        member_doc = db.collection('groups').document(invitation_data.group_id).collection('members').document(current_user.uid).get()
-        if not member_doc.exists or member_doc.to_dict().get('role') != 'admin':
-            raise HTTPException(status_code=403, detail="Admin privileges required")
         
         # Get group details
         group_doc = db.collection('groups').document(invitation_data.group_id).get()
@@ -102,7 +99,7 @@ async def create_invitation(
 
 @router.get("/validate/{token}", response_model=ReactAPIResponse)
 async def validate_invitation(token: str):
-    """Validate invitation token for React join page"""
+    """Validate invitation token (public endpoint)"""
     try:
         db = get_firestore_client()
         
@@ -112,28 +109,28 @@ async def validate_invitation(token: str):
         if not invitations:
             return ReactAPIResponse(
                 success=False,
-                message="Invalid invitation token",
-                data={
-                    "is_valid": False,
-                    "error_code": "INVALID_TOKEN"
-                },
-                meta={
-                    "redirect": "/groups"
-                }
+                message="Invalid or expired invitation",
+                data={"is_valid": False}
             )
         
         invitation_doc = invitations[0]
         invitation_data = invitation_doc.to_dict()
         
-        # Check if invitation is expired
-        is_expired = datetime.utcnow() > invitation_data['expires_at']
+        # Check if expired
+        if invitation_data['expires_at'] < datetime.utcnow():
+            return ReactAPIResponse(
+                success=False,
+                message="Invitation has expired",
+                data={"is_valid": False, "reason": "expired"}
+            )
         
         # Check usage limits
-        max_uses = invitation_data.get('max_uses')
-        current_uses = invitation_data.get('current_uses', 0)
-        is_usage_exceeded = max_uses and current_uses >= max_uses
-        
-        is_valid = not is_expired and not is_usage_exceeded
+        if invitation_data.get('max_uses') and invitation_data['current_uses'] >= invitation_data['max_uses']:
+            return ReactAPIResponse(
+                success=False,
+                message="Invitation usage limit reached",
+                data={"is_valid": False, "reason": "usage_limit"}
+            )
         
         # Get group details
         group_doc = db.collection('groups').document(invitation_data['group_id']).get()
@@ -141,49 +138,23 @@ async def validate_invitation(token: str):
             return ReactAPIResponse(
                 success=False,
                 message="Group not found",
-                data={
-                    "is_valid": False,
-                    "error_code": "GROUP_NOT_FOUND"
-                }
+                data={"is_valid": False, "reason": "group_not_found"}
             )
         
         group_data = group_doc.to_dict()
         
-        # Calculate remaining uses
-        uses_remaining = None
-        if max_uses:
-            uses_remaining = max(0, max_uses - current_uses)
-        
-        validation_data = {
-            "is_valid": is_valid,
-            "group_id": invitation_data['group_id'],
-            "group_name": group_data['name'],
-            "group_description": group_data['description'],
-            "group_industry": group_data['industry'],
-            "group_logo_url": group_data.get('logo_url'),
-            "group_member_count": group_data.get('member_count', 0),
-            "expires_at": invitation_data['expires_at'],
-            "uses_remaining": uses_remaining,
-            "invitation_expired": is_expired,
-            "usage_exceeded": is_usage_exceeded
-        }
-        
-        if is_valid:
-            message = f"Valid invitation to join {group_data['name']}"
-        elif is_expired:
-            message = "This invitation has expired"
-        elif is_usage_exceeded:
-            message = "This invitation has reached its usage limit"
-        else:
-            message = "Invalid invitation"
-        
         return ReactAPIResponse(
-            success=is_valid,
-            message=message,
-            data=validation_data,
-            meta={
-                "can_join": is_valid,
-                "requires_auth": True
+            success=True,
+            message="Valid invitation",
+            data={
+                "is_valid": True,
+                "group_id": invitation_data['group_id'],
+                "group_name": group_data['name'],
+                "group_description": group_data['description'],
+                "group_industry": group_data['industry'],
+                "expires_at": invitation_data['expires_at'],
+                "uses_remaining": invitation_data.get('max_uses') - invitation_data['current_uses'] if invitation_data.get('max_uses') else None,
+                "invitation_id": invitation_doc.id
             }
         )
         
@@ -196,106 +167,78 @@ async def join_via_invitation(
     token: str,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Join group via invitation token with React state management"""
+    """Join group via invitation token"""
     try:
         db = get_firestore_client()
         
-        # Validate invitation first
-        validation_response = await validate_invitation(token)
-        validation_data = validation_response.data
+        # Find invitation by token
+        invitations = db.collection('invitations').where('token', '==', token).where('is_active', '==', True).get()
         
-        if not validation_data.get('is_valid'):
-            return ReactAPIResponse(
-                success=False,
-                message=validation_response.message,
-                data={
-                    "error_code": "INVALID_INVITATION",
-                    "validation_error": validation_data
-                }
-            )
+        if not invitations:
+            raise HTTPException(status_code=400, detail="Invalid or expired invitation")
         
-        group_id = validation_data['group_id']
-        group_name = validation_data['group_name']
+        invitation_doc = invitations[0]
+        invitation_data = invitation_doc.to_dict()
+        
+        # Check if expired
+        if invitation_data['expires_at'] < datetime.utcnow():
+            raise HTTPException(status_code=400, detail="Invitation has expired")
+        
+        # Check usage limits
+        if invitation_data.get('max_uses') and invitation_data['current_uses'] >= invitation_data['max_uses']:
+            raise HTTPException(status_code=400, detail="Invitation usage limit reached")
+        
+        group_id = invitation_data['group_id']
         
         # Check if user is already a member
         member_doc = db.collection('groups').document(group_id).collection('members').document(current_user.uid).get()
         if member_doc.exists:
-            return ReactAPIResponse(
-                success=False,
-                message="You are already a member of this group",
-                data={
-                    "error_code": "ALREADY_MEMBER",
-                    "group": {
-                        "id": group_id,
-                        "name": group_name
-                    }
-                },
-                meta={
-                    "redirect": f"/groups/{group_id}"
-                }
-            )
+            raise HTTPException(status_code=400, detail="Already a member of this group")
         
-        # Check group capacity
-        group_doc = db.collection('groups').document(group_id).get()
-        group_data = group_doc.to_dict()
-        max_members = group_data.get('max_members')
-        current_member_count = group_data.get('member_count', 0)
-        
-        if max_members and current_member_count >= max_members:
-            return ReactAPIResponse(
-                success=False,
-                message="This group has reached its maximum capacity",
-                data={
-                    "error_code": "GROUP_FULL",
-                    "max_members": max_members,
-                    "current_members": current_member_count
-                }
-            )
+        # Check if there's a pending join request
+        existing_requests = db.collection('join_requests').where('group_id', '==', group_id).where('user_id', '==', current_user.uid).where('status', '==', 'pending').get()
+        if len(existing_requests) > 0:
+            raise HTTPException(status_code=400, detail="Join request already pending")
         
         # Add user to group
         member_data = {
             'user_id': current_user.uid,
             'role': 'member',
             'joined_at': datetime.utcnow(),
-            'joined_via': 'invitation',
-            'invitation_token': token
+            'updated_at': datetime.utcnow()
         }
         
         db.collection('groups').document(group_id).collection('members').document(current_user.uid).set(member_data)
         
-        # Update group member count
-        group_ref = db.collection('groups').document(group_id)
-        group_ref.update({'member_count': Increment(1)})
+        # Increment member count
+        db.collection('groups').document(group_id).update({
+            'member_count': Increment(1)
+        })
         
-        # Update invitation usage
-        invitations = db.collection('invitations').where('token', '==', token).get()
-        if invitations:
-            invitation_doc = invitations[0]
-            invitation_ref = db.collection('invitations').document(invitation_doc.id)
-            invitation_ref.update({'current_uses': Increment(1)})
+        # Increment invitation usage
+        db.collection('invitations').document(invitation_doc.id).update({
+            'current_uses': Increment(1)
+        })
+        
+        # Get group details for response
+        group_doc = db.collection('groups').document(group_id).get()
+        group_data = group_doc.to_dict()
         
         return ReactAPIResponse(
             success=True,
-            message=f"Welcome to {group_name}!",
+            message=f"Successfully joined '{group_data['name']}'",
             data={
-                "group": {
-                    "id": group_id,
-                    "name": group_name,
-                    "description": validation_data['group_description'],
-                    "industry": validation_data['group_industry'],
-                    "logo_url": validation_data.get('group_logo_url'),
-                    "member_count": current_member_count + 1
-                },
-                "membership": {
-                    "role": "member",
-                    "joined_at": member_data['joined_at'],
-                    "joined_via": "invitation"
-                }
+                "group_id": group_id,
+                "group_name": group_data['name'],
+                "user_role": "member"
             },
             meta={
                 "redirect": f"/groups/{group_id}",
-                "welcome_message": True,
-                "first_time_member": True
+                "next_steps": [
+                    "Explore group products",
+                    "Connect with other members",
+                    "Start purchasing"
+                ]
             }
         )
         
@@ -308,101 +251,47 @@ async def join_via_invitation(
 @router.get("/group/{group_id}", response_model=ReactAPIResponse)
 async def get_group_invitations(
     group_id: str,
-    current_user: UserResponse = Depends(get_current_user)
+    current_user: UserResponse = Depends(require_group_admin)
 ):
-    """Get all invitations for a group with React table data"""
+    """Get all invitations for a group (admin only)"""
     try:
         db = get_firestore_client()
         
-        # Verify admin permissions
-        member_doc = db.collection('groups').document(group_id).collection('members').document(current_user.uid).get()
-        if not member_doc.exists or member_doc.to_dict().get('role') != 'admin':
-            raise HTTPException(status_code=403, detail="Admin privileges required")
-        
-        # Get group info
-        group_doc = db.collection('groups').document(group_id).get()
-        if not group_doc.exists:
-            raise HTTPException(status_code=404, detail="Group not found")
-        
-        group_data = group_doc.to_dict()
-        
-        # Get all invitations for the group
+        # Get invitations for the group
         invitations_docs = db.collection('invitations').where('group_id', '==', group_id).order_by('created_at', direction='DESCENDING').get()
         
-        settings = get_settings()
         invitations = []
-        active_count = 0
-        expired_count = 0
-        used_count = 0
-        
-        for doc in invitations_docs:
-            invitation_data = doc.to_dict()
+        for inv_doc in invitations_docs:
+            inv_data = inv_doc.to_dict()
             
             # Calculate status
-            is_expired = datetime.utcnow() > invitation_data['expires_at']
-            max_uses = invitation_data.get('max_uses')
-            current_uses = invitation_data.get('current_uses', 0)
-            is_fully_used = max_uses and current_uses >= max_uses
-            is_active = invitation_data.get('is_active', True)
+            is_expired = inv_data['expires_at'] < datetime.utcnow()
+            is_used_up = inv_data.get('max_uses') and inv_data['current_uses'] >= inv_data['max_uses']
             
-            # Determine overall status
-            if not is_active:
-                status = 'deactivated'
-            elif is_expired:
-                status = 'expired'
-                expired_count += 1
-            elif is_fully_used:
-                status = 'fully_used'
-                used_count += 1
-            else:
-                status = 'active'
-                active_count += 1
+            inv_data['status'] = 'active'
+            if is_expired:
+                inv_data['status'] = 'expired'
+            elif is_used_up:
+                inv_data['status'] = 'used_up'
             
-            # Build invitation URL
-            invitation_url = f"{settings.FRONTEND_URL}/join/{invitation_data['token']}"
-            
-            # Calculate remaining uses
-            uses_remaining = None
-            if max_uses:
-                uses_remaining = max(0, max_uses - current_uses)
-            
-            # Get creator info
-            creator_doc = db.collection('users').document(invitation_data['created_by']).get()
-            creator_name = creator_doc.to_dict().get('display_name', 'Unknown') if creator_doc.exists else 'Unknown'
-            
-            invitation_info = {
-                **invitation_data,
-                'status': status,
-                'invitation_url': invitation_url,
-                'uses_remaining': uses_remaining,
-                'creator_name': creator_name,
-                'is_expired': is_expired,
-                'is_fully_used': is_fully_used,
-                'can_be_shared': status == 'active'
-            }
-            
-            invitations.append(invitation_info)
+            invitations.append(inv_data)
+        
+        # Calculate stats
+        active_count = len([i for i in invitations if i['status'] == 'active'])
+        expired_count = len([i for i in invitations if i['status'] == 'expired'])
+        used_up_count = len([i for i in invitations if i['status'] == 'used_up'])
         
         return ReactAPIResponse(
             success=True,
             message="Group invitations retrieved",
             data={
                 "invitations": invitations,
-                "group": {
-                    "id": group_id,
-                    "name": group_data['name']
-                },
                 "stats": {
                     "total": len(invitations),
                     "active": active_count,
                     "expired": expired_count,
-                    "fully_used": used_count,
-                    "deactivated": len(invitations) - active_count - expired_count - used_count
+                    "used_up": used_up_count
                 }
-            },
-            meta={
-                "has_active_invitations": active_count > 0,
-                "can_create_more": True
             }
         )
         
@@ -417,7 +306,7 @@ async def deactivate_invitation(
     invitation_id: str,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Deactivate invitation with React confirmation"""
+    """Deactivate invitation (admin only)"""
     try:
         db = get_firestore_client()
         
@@ -427,19 +316,17 @@ async def deactivate_invitation(
             raise HTTPException(status_code=404, detail="Invitation not found")
         
         invitation_data = invitation_doc.to_dict()
+        group_id = invitation_data['group_id']
         
-        # Check if user has permission (creator or group admin)
-        has_permission = False
-        if invitation_data['created_by'] == current_user.uid:
-            has_permission = True
-        else:
-            # Check if user is group admin
-            member_doc = db.collection('groups').document(invitation_data['group_id']).collection('members').document(current_user.uid).get()
-            if member_doc.exists and member_doc.to_dict().get('role') == 'admin':
-                has_permission = True
+        # Verify admin privileges by checking group membership directly
+        member_doc = db.collection('groups').document(group_id).collection('members').document(current_user.uid).get()
         
-        if not has_permission:
-            raise HTTPException(status_code=403, detail="Permission denied")
+        if not member_doc.exists:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+        
+        member_data = member_doc.to_dict()
+        if member_data.get('role') != 'admin':
+            raise HTTPException(status_code=403, detail="Admin privileges required")
         
         # Deactivate invitation
         db.collection('invitations').document(invitation_id).update({
@@ -450,18 +337,8 @@ async def deactivate_invitation(
         
         return ReactAPIResponse(
             success=True,
-            message="Invitation deactivated successfully",
-            data={
-                "invitation": {
-                    "id": invitation_id,
-                    "group_name": invitation_data['group_name'],
-                    "status": "deactivated"
-                }
-            },
-            meta={
-                "action": "invitation_deactivated",
-                "requires_refresh": True
-            }
+            message="Invitation deactivated",
+            data={"invitation_id": invitation_id}
         )
         
     except HTTPException:
@@ -475,7 +352,7 @@ async def regenerate_invitation_token(
     invitation_id: str,
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Regenerate invitation token for React security management"""
+    """Regenerate invitation token (admin only)"""
     try:
         db = get_firestore_client()
         
@@ -485,128 +362,95 @@ async def regenerate_invitation_token(
             raise HTTPException(status_code=404, detail="Invitation not found")
         
         invitation_data = invitation_doc.to_dict()
+        group_id = invitation_data['group_id']
         
-        # Check permissions
-        has_permission = False
-        if invitation_data['created_by'] == current_user.uid:
-            has_permission = True
-        else:
-            member_doc = db.collection('groups').document(invitation_data['group_id']).collection('members').document(current_user.uid).get()
-            if member_doc.exists and member_doc.to_dict().get('role') == 'admin':
-                has_permission = True
+        # Verify admin privileges by checking group membership directly
+        member_doc = db.collection('groups').document(group_id).collection('members').document(current_user.uid).get()
         
-        if not has_permission:
-            raise HTTPException(status_code=403, detail="Permission denied")
+        if not member_doc.exists:
+            raise HTTPException(status_code=403, detail="Not a member of this group")
+        
+        member_data = member_doc.to_dict()
+        if member_data.get('role') != 'admin':
+            raise HTTPException(status_code=403, detail="Admin privileges required")
         
         # Generate new token
         new_token = secrets.token_urlsafe(32)
         
-        # Update invitation with new token
+        # Update invitation
         db.collection('invitations').document(invitation_id).update({
             'token': new_token,
-            'current_uses': 0,  # Reset usage count
+            'current_uses': 0,
+            'is_active': True,
             'regenerated_at': datetime.utcnow(),
             'regenerated_by': current_user.uid
         })
         
+        # Generate new invitation URL
         settings = get_settings()
         new_invitation_url = f"{settings.FRONTEND_URL}/join/{new_token}"
         
         return ReactAPIResponse(
             success=True,
-            message="Invitation token regenerated successfully",
+            message="Invitation token regenerated",
             data={
-                "invitation": {
-                    "id": invitation_id,
-                    "token": new_token,
-                    "invitation_url": new_invitation_url,
-                    "group_name": invitation_data['group_name'],
-                    "uses_reset": True
-                }
-            },
-            meta={
-                "new_shareable_link": new_invitation_url,
-                "security_action": "token_regenerated"
+                "invitation_id": invitation_id,
+                "new_token": new_token,
+                "new_invitation_url": new_invitation_url
             }
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to regenerate invitation: {e}")
-        raise HTTPException(status_code=500, detail="Failed to regenerate invitation")
+        logger.error(f"Failed to regenerate invitation token: {e}")
+        raise HTTPException(status_code=500, detail="Failed to regenerate token")
 
 @router.get("/my-invitations", response_model=ReactAPIResponse)
 async def get_my_invitations(
     current_user: UserResponse = Depends(get_current_user)
 ):
-    """Get all invitations created by current user for React dashboard"""
+    """Get invitations created by current user"""
     try:
         db = get_firestore_client()
         
-        # Get all invitations created by current user
+        # Get invitations created by user
         invitations_docs = db.collection('invitations').where('created_by', '==', current_user.uid).order_by('created_at', direction='DESCENDING').get()
         
-        settings = get_settings()
         invitations = []
-        
-        for doc in invitations_docs:
-            invitation_data = doc.to_dict()
+        for inv_doc in invitations_docs:
+            inv_data = inv_doc.to_dict()
+            
+            # Get group details
+            group_doc = db.collection('groups').document(inv_data['group_id']).get()
+            if group_doc.exists:
+                group_data = group_doc.to_dict()
+                inv_data['group_name'] = group_data['name']
+                inv_data['group_industry'] = group_data.get('industry')
             
             # Calculate status
-            is_expired = datetime.utcnow() > invitation_data['expires_at']
-            max_uses = invitation_data.get('max_uses')
-            current_uses = invitation_data.get('current_uses', 0)
-            is_fully_used = max_uses and current_uses >= max_uses
-            is_active = invitation_data.get('is_active', True)
+            is_expired = inv_data['expires_at'] < datetime.utcnow()
+            is_used_up = inv_data.get('max_uses') and inv_data['current_uses'] >= inv_data['max_uses']
             
-            if not is_active:
-                status = 'deactivated'
-            elif is_expired:
-                status = 'expired'
-            elif is_fully_used:
-                status = 'fully_used'
-            else:
-                status = 'active'
+            inv_data['status'] = 'active'
+            if is_expired:
+                inv_data['status'] = 'expired'
+            elif is_used_up:
+                inv_data['status'] = 'used_up'
             
-            invitation_url = f"{settings.FRONTEND_URL}/join/{invitation_data['token']}"
-            
-            invitations.append({
-                **invitation_data,
-                'status': status,
-                'invitation_url': invitation_url,
-                'is_expired': is_expired,
-                'is_fully_used': is_fully_used
-            })
-        
-        # Calculate stats
-        active_count = len([inv for inv in invitations if inv['status'] == 'active'])
-        expired_count = len([inv for inv in invitations if inv['status'] == 'expired'])
-        total_uses = sum(inv.get('current_uses', 0) for inv in invitations)
+            invitations.append(inv_data)
         
         return ReactAPIResponse(
             success=True,
             message="Your invitations retrieved",
-            data={
-                "invitations": invitations,
-                "stats": {
-                    "total": len(invitations),
-                    "active": active_count,
-                    "expired": expired_count,
-                    "total_uses": total_uses
-                }
-            },
-            meta={
-                "has_invitations": len(invitations) > 0,
-                "has_active": active_count > 0
-            }
+            data={"invitations": invitations}
         )
         
     except Exception as e:
         logger.error(f"Failed to get user invitations: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve your invitations")
+        raise HTTPException(status_code=500, detail="Failed to retrieve invitations")
 
-# Helper function for background task
+# Helper function for sending invitation emails
 async def send_invitation_emails(
     email_list: List[str], 
     group_name: str, 
@@ -614,137 +458,60 @@ async def send_invitation_emails(
     inviter_name: str,
     invitation_url: str
 ):
-    """Send invitation emails with React-optimized template"""
+    """Send invitation emails to list of email addresses"""
     try:
-        # Create invitation email template
-        subject = f"Join {group_name} on Procur - Invitation from {inviter_name}"
+        settings = get_settings()
         
-        html_body = f"""
-        <html>
-        <head>
-            <style>
-                body {{ 
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif; 
-                    line-height: 1.6; 
-                    color: #333; 
-                    margin: 0; 
-                    padding: 0; 
-                }}
-                .container {{ 
-                    max-width: 600px; 
-                    margin: 0 auto; 
-                    padding: 20px; 
-                    background: #ffffff;
-                }}
-                .header {{ 
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                    color: white; 
-                    padding: 30px 20px; 
-                    text-align: center; 
-                    border-radius: 8px 8px 0 0;
-                }}
-                .content {{ 
-                    padding: 30px 20px; 
-                    background: #f8fafc; 
-                    border-radius: 0 0 8px 8px;
-                }}
-                .button {{ 
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                    color: white; 
-                    padding: 15px 30px; 
-                    text-decoration: none; 
-                    border-radius: 6px; 
-                    display: inline-block; 
-                    font-weight: 600;
-                    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-                }}
-                .features {{ 
-                    background: white; 
-                    padding: 20px; 
-                    margin: 20px 0; 
-                    border-radius: 6px; 
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                }}
-                .footer {{ 
-                    padding: 20px; 
-                    text-align: center; 
-                    color: #64748b; 
-                    font-size: 14px;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="header">
-                    <h1 style="margin: 0; font-size: 28px;">🎉 You're Invited!</h1>
-                    <p style="margin: 10px 0 0 0; opacity: 0.9; font-size: 18px;">Join {group_name} on Procur</p>
-                </div>
-                <div class="content">
-                    <p style="font-size: 16px; margin-bottom: 20px;">Hi there!</p>
-                    <p style="font-size: 16px;"><strong>{inviter_name}</strong> has invited you to join <strong>{group_name}</strong> on Procur, the platform that helps businesses save money through group purchasing power.</p>
+        for email in email_list:
+            try:
+                # Create email template
+                template = EmailTemplate(
+                    subject=f"Join {group_name} - Group Purchasing Organization",
+                    html_body=f"""
+                    <h2>You're invited to join {group_name}!</h2>
+                    <p>Hi there,</p>
+                    <p>{inviter_name} has invited you to join their group purchasing organization.</p>
+                    <p><strong>Group:</strong> {group_name}</p>
+                    <p><strong>What you'll get:</strong></p>
+                    <ul>
+                        <li>Access to bulk purchasing discounts</li>
+                        <li>Curated products for your industry</li>
+                        <li>Network with other businesses</li>
+                    </ul>
+                    <p><a href="{invitation_url}" style="background-color: #007bff; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Join Group Now</a></p>
+                    <p>This invitation link will expire soon, so don't wait!</p>
+                    <p>Best regards,<br>The Procur Team</p>
+                    """,
+                    text_body=f"""
+                    You're invited to join {group_name}!
                     
-                    <div class="features">
-                        <h3 style="color: #475569; margin-top: 0;">What you'll get:</h3>
-                        <ul style="color: #64748b; padding-left: 20px;">
-                            <li>Access to exclusive group discounts from verified suppliers</li>
-                            <li>Connect with other businesses in your industry</li>
-                            <li>Streamlined procurement process</li>
-                            <li>Transparent pricing and bulk buying power</li>
-                        </ul>
-                    </div>
+                    Hi there,
                     
-                    <div style="text-align: center; margin: 30px 0;">
-                        <a href="{invitation_url}" class="button">Join {group_name}</a>
-                    </div>
+                    {inviter_name} has invited you to join their group purchasing organization.
                     
-                    <p style="font-size: 14px; color: #64748b; margin-top: 30px;">
-                        <strong>Note:</strong> This invitation link will expire in 7 days. 
-                        If you're new to Procur, you'll be able to create your account during the join process.
-                    </p>
-                </div>
-                <div class="footer">
-                    <p>This invitation was sent by {inviter_name} via Procur</p>
-                    <p style="margin: 5px 0;">Questions? Contact our support team</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        text_body = f"""
-        You're Invited to Join {group_name} on Procur!
-        
-        Hi there!
-        
-        {inviter_name} has invited you to join {group_name} on Procur, the platform that helps businesses save money through group purchasing power.
-        
-        What you'll get:
-        • Access to exclusive group discounts from verified suppliers
-        • Connect with other businesses in your industry  
-        • Streamlined procurement process
-        • Transparent pricing and bulk buying power
-        
-        Join now: {invitation_url}
-        
-        Note: This invitation link will expire in 7 days. If you're new to Procur, you'll be able to create your account during the join process.
-        
-        This invitation was sent by {inviter_name} via Procur
-        Questions? Contact our support team
-        """
-        
-        template = EmailTemplate(
-            subject=subject,
-            html_body=html_body,
-            text_body=text_body
-        )
-        
-        # Send emails
-        results = await email_service.send_bulk_emails(email_list, template)
-        successful_sends = sum(1 for result in results if result is True)
-        
-        logger.info(f"Sent {successful_sends}/{len(email_list)} invitation emails for group {group_name}")
-        
+                    Group: {group_name}
+                    
+                    What you'll get:
+                    - Access to bulk purchasing discounts
+                    - Curated products for your industry
+                    - Network with other businesses
+                    
+                    Join now: {invitation_url}
+                    
+                    This invitation link will expire soon, so don't wait!
+                    
+                    Best regards,
+                    The Procur Team
+                    """
+                )
+                
+                # Send email
+                await email_service.send_email(email, template)
+                logger.info(f"Invitation email sent to {email}")
+                
+            except Exception as e:
+                logger.error(f"Failed to send invitation email to {email}: {e}")
+                continue
+                
     except Exception as e:
         logger.error(f"Failed to send invitation emails: {e}")
-
-# EOF

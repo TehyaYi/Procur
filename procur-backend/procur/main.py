@@ -9,6 +9,7 @@ import os
 from procur.core.config import get_settings
 from procur.core.firebase import initialize_firebase
 from procur.core.middleware import RateLimitMiddleware, LoggingMiddleware
+from procur.core.security import setup_security_middleware
 from procur.core.exceptions import (
     procur_exception_handler,
     validation_exception_handler,
@@ -65,21 +66,8 @@ app = FastAPI(
 
 settings = get_settings()
 
-# Security middleware
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=settings.ALLOWED_HOSTS
-)
-
-# Enhanced CORS for React development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS + ["http://localhost:3000", "http://127.0.0.1:3000"],  # React dev server
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["X-Process-Time", "X-RateLimit-Remaining"],
-)
+# Setup security middleware (includes CORS, security headers, rate limiting)
+setup_security_middleware(app)
 
 # Custom middleware
 app.add_middleware(LoggingMiddleware)
